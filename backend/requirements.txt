@@ -1,0 +1,21 @@
+# Core Flask dependencies
+flask
+flask-cors
+
+# LangChain and related packages
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-huggingface
+langchain-chroma
+langchain-ollama
+
+# Vector database
+chromadb
+
+# Embeddings
+sentence-transformers
+
+# Progress bar
+tqdm
