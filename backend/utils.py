@@ -6,6 +6,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # model = os.environ.get("MODEL", "llama2-uncensored")
 # model = os.environ.get("MODEL", "llama2")
@@ -14,22 +15,30 @@ embeddings_model_name = os.environ.get("EMBEDDINGS_MODEL_NAME", "all-MiniLM-L6-v
 persist_directory = os.environ.get("PERSIST_DIRECTORY", "db")
 target_source_chunks = int(os.environ.get('TARGET_SOURCE_CHUNKS', 4))
 
-embeddings = HuggingFaceEmbeddings(model_name=embeddings_model_name)
+# Cache embeddings model
+embeddings = HuggingFaceEmbeddings(model_name=embeddings_model_name, model_kwargs={'device': 'cpu'})
 db = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
 retriever = db.as_retriever(search_kwargs={"k": target_source_chunks})
 
-llm = OllamaLLM(model=model)
+# Use num_predict to limit response length for faster generation
+llm = OllamaLLM(model=model, num_predict=200, temperature=0.3)
+llm_related = OllamaLLM(model=model, num_predict=100, temperature=0.5)  # Shorter for related questions
 
-# RAG prompt template
-rag_template = """Use the following pieces of context to answer the question at the end. 
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
+# RAG prompt template - optimized for X/Twitter support
+rag_template = """You are X (Twitter) Support Assistant. Answer the user's question using ONLY the context provided.
+
+Rules:
+- Be helpful, friendly, and concise (2-4 sentences max)
+- Use bullet points for steps
+- If the context doesn't contain the answer, say "I don't have specific information about that. Please visit help.x.com for more details."
+- Never make up information
 
 Context:
 {context}
 
-Question: {question}
+User Question: {question}
 
-Answer:"""
+Response:"""
 
 rag_prompt = PromptTemplate.from_template(rag_template)
 
@@ -46,8 +55,14 @@ rag_chain = (
 
 
 def generate_related_questions(parent_question, related_context):
-    query = f"""what are some related questions that can be asked for the parent question '{parent_question}' based on the following related context:\n{related_context}. Only include the related questions in a numbered format"""
-    res = llm.invoke(query)
+    query = f"""Based on this X/Twitter support topic, suggest exactly 3 follow-up questions the user might ask. Keep each question under 10 words.
+
+Topic: {parent_question}
+
+1.
+2.
+3."""
+    res = llm_related.invoke(query)
     return res
 
 def extract_related_context(docs):
@@ -56,19 +71,27 @@ def extract_related_context(docs):
         related_context += f"\n> {document.metadata['source']}:\n{document.page_content}\n"
     return related_context
 
-def generate_rag_response(query):
+def generate_rag_response(query, include_related=True):
     s = time.time()
-    # Get source documents
+    # Get source documents first (needed for both tasks)
     docs = retriever.invoke(query)
-    # Get answer from RAG chain
-    answer = rag_chain.invoke(query)
-    e = time.time()
-    print(f"took {e-s} seconds to complete RAG based QA")
-
-    s = time.time()
     related_context = extract_related_context(docs)
-    related_questions = generate_related_questions(query, related_context)
+    
+    # Run RAG answer and related questions in parallel
+    if include_related:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Submit both tasks
+            future_answer = executor.submit(rag_chain.invoke, query)
+            future_related = executor.submit(generate_related_questions, query, related_context)
+            
+            # Get results
+            answer = future_answer.result()
+            related_questions = future_related.result()
+    else:
+        answer = rag_chain.invoke(query)
+        related_questions = ""
+    
     e = time.time()
-    print(f"took {e-s} seconds to generate related_questions")
+    print(f"took {e-s} seconds total (parallel execution)")
     
     return answer, related_questions
